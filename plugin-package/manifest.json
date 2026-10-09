@@ -1,0 +1,33 @@
+{
+  "v": 1,
+  "id": "com.ghostproxifier.snagbox",
+  "version": "0.0.2",
+  "name": {
+    "zh": "snagbox 流量采集",
+    "en": "snagbox Traffic Capture"
+  },
+  "description": {
+    "zh": "管理 mitmproxy 流量采集和 MCP 查询，并可通过 Ghost 把选定程序注入后路由到 snagbox。",
+    "en": "Manage mitmproxy capture and MCP queries, and route a selected Ghost-injected program through snagbox."
+  },
+  "author": {
+    "name": "snagbox"
+  },
+  "category": "network",
+  "entry": "plugin_main.py",
+  "args": [],
+  "runtime": {
+    "kind": "python",
+    "minVersion": "3.12"
+  },
+  "ui": {
+    "embedded": true
+  },
+  "standalone": false,
+  "permissions": [
+    "config.read",
+    "config.write",
+    "target.launch",
+    "target.control"
+  ]
+}

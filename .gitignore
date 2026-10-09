@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+plugin-package/.stage/
+plugin-package/dist/
