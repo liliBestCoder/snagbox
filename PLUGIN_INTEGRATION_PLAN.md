@@ -45,7 +45,7 @@ Ghost 插件宿主用 Windows Job Object 管插件进程。插件停用或宿主
 - Host 会把插件进程放入 Job Object；停止通过握手提供的命名 Windows event 请求，约 3 秒后仍未退出会硬终止 Job。插件要显式等待握手里的 `stopEvent` 并完成清理。
 - 插件 UI iframe 与 Ghost 控制接口不同源，拿不到 `window.GHOST_TOKEN`，不能从 UI 直接请求 Ghost API。插件服务必须自己提供 UI 后端；若要访问 Ghost API，由插件进程使用自己的 token 和清单权限调用。
 - 原始 payload 不从 Ghost 插件 API 获取。Snagbox 遵循官方 Plugin SDK 规范申请标准权限组 `ghost.target.v1`、`ghost.upstream.v1`、`ghost.ui.v1`、`ghost.log.v1`；用户在 Ghost 启用弹窗授权。它们分别用于：通过专用 Upstream API 管理 snagbox HTTP 节点、通过 Target API 纳管启动/停止注入程序与强制 DOT DNS 模式、向 Ghost 上报审计日志与展示原生 Toast 提示。
-- 打包规范升级：使用官方 `tools/plugin/gpkg.py` 进行标准校验与打包（minAppVersion >= 1.2.1），杜绝非标权限与非法 API 访问。
+- 打包规范升级：使用官方 `tools/plugin/gpkg.py` 进行标准校验与打包（minAppVersion >= 1.2.2），杜绝非标权限与非法 API 访问。
 - 开发者模式可以从本地 `.gpkg` 安装未签名插件；插件安装后默认停用，启用时仍走权限确认。官方上架还要签名、发布描述和注册表流程，属于后续阶段。
 
 ## 3. 目标范围与非目标

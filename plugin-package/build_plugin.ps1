@@ -1,6 +1,6 @@
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot "dist"),
-    [string]$MinimumGhostVersion = "1.2.1",
+    [string]$MinimumGhostVersion = "1.2.2",
     [string]$SdkRef = "bb0c51dc64587e0dbe898fd554593eb28438a11a",
     [string]$PythonExe = "",
     [switch]$SkipCompile = $false
