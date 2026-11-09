@@ -16,6 +16,8 @@
 |---|---|---|
 | 批次 | `capture_session.session_id` ↔ `conn/http/dns/tcp_message/udp_message.session_id` | 同一次采集；不表示同一条流 |
 | Flow ID | `conn.uid` ↔ `http.uid` | HTTP hook 使用同一 Flow ID 写入两表 |
+| Flow ID | `http.uid` ↔ `filter_hits.flow_uid` | 命中的 Filter 动作与原始 HTTP 记录强关联；可溯源被篡改/Mock的原始端点 |
+| Filter 规则 | `filter_registry.name` ↔ `filter_hits.filter_name` | 命中记录归属的具体动态 Filter 规则名称 |
 | Flow ID | `conn.uid` ↔ `tcp_message.uid` / `udp_message.uid` | 数据块外键指向对应传输 flow 的连接记录 |
 | Flow ID | `dns.uid` ↔ `conn.uid` | **当前不保证关联**：DNS hook 不保证创建同 UID 的 `conn` 记录 |
 | 网络端点 | `conn/http/dns` 的 `proto`、`id.orig_h`、`id.orig_p`、`id.resp_h`、`id.resp_p` | 端点相同是候选关联；应结合采集批次和时间。数据块表通过 `uid` 回到 `conn` 查端点 |

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
+import random
+import re
+import sqlite3
 import threading
 import time
+import traceback
+import urllib
+import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from mitmproxy import ctx
+from mitmproxy import ctx, http
 
-from database import AsyncNetTraceDB, read_capture_state
+from database import AsyncNetTraceDB, read_capture_state, readonly_connection
 
 
 def flow_uid(flow: Any) -> str:
@@ -47,6 +55,17 @@ def local_flag(host: str | None) -> int | None:
     return int(host in {"127.0.0.1", "::1", "localhost"})
 
 
+def safe_log(msg: str, level: str = "info") -> None:
+    try:
+        log_obj = getattr(ctx, "log", None)
+        if log_obj is not None:
+            fn = getattr(log_obj, level, None)
+            if callable(fn):
+                fn(msg)
+    except Exception:
+        pass
+
+
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -62,9 +81,255 @@ def header_pairs_json(headers: Any) -> str | None:
     return json_text([[str(name), str(value)] for name, value in pairs])
 
 
+class FilterInstance:
+    def __init__(self, name: str, code: str, priority: int, updated_at: float):
+        self.name = name
+        self.code = code
+        self.priority = priority
+        self.updated_at = updated_at
+        self.on_request_fn: Callable[[Any], Any] | None = None
+        self.on_response_fn: Callable[[Any], Any] | None = None
+        self.consecutive_errors = 0
+        self.is_tripped = False
+        self.compile_error: str | None = None
+
+    def compile(self) -> bool:
+        env = {
+            "__builtins__": __builtins__,
+            "http": http,
+            "json": json,
+            "time": time,
+            "re": re,
+            "base64": base64,
+            "hashlib": hashlib,
+            "hmac": hmac,
+            "random": random,
+            "urllib": urllib,
+            "urlparse": urllib.parse,
+        }
+        try:
+            compiled = compile(self.code, f"<filter:{self.name}>", "exec")
+            exec(compiled, env)
+            self.on_request_fn = env.get("on_request")
+            self.on_response_fn = env.get("on_response")
+            self.compile_error = None
+            return True
+        except Exception as exc:
+            self.compile_error = f"{type(exc).__name__}: {exc}"
+            return False
+
+
+class FilterManager:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.filters: dict[str, FilterInstance] = {}
+        self.lock = threading.Lock()
+
+    def sync_from_db(self) -> None:
+        if not self.db_path.exists():
+            return
+        try:
+            conn = readonly_connection(self.db_path)
+            rows = conn.execute(
+                "SELECT name, code, priority, enabled, updated_at, error "
+                "FROM filter_registry WHERE enabled=1 ORDER BY priority ASC, name ASC"
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return
+
+        active_names = set()
+        with self.lock:
+            for row in rows:
+                name, code, priority, enabled, updated_at, err = (
+                    row["name"], row["code"], row["priority"], row["enabled"], row["updated_at"], row["error"]
+                )
+                active_names.add(name)
+                existing = self.filters.get(name)
+                if existing is None or existing.updated_at != updated_at or existing.code != code:
+                    instance = FilterInstance(name, code, priority, updated_at)
+                    if instance.compile():
+                        self.filters[name] = instance
+                        safe_log(f"Loaded dynamic filter: {name}", "info")
+                    else:
+                        safe_log(f"Failed to compile dynamic filter {name}: {instance.compile_error}", "warn")
+                        self._record_filter_error(name, instance.compile_error or "compile_failed")
+
+            # Remove filters that are disabled or deleted
+            for name in list(self.filters.keys()):
+                if name not in active_names:
+                    del self.filters[name]
+                    safe_log(f"Unloaded dynamic filter: {name}", "info")
+
+    def _record_filter_error(self, name: str, error_msg: str, trip: bool = False) -> None:
+        def update_db():
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=5.0)
+                if trip:
+                    conn.execute(
+                        "UPDATE filter_registry SET enabled=0, error=?, updated_at=strftime('%s','now') WHERE name=?",
+                        (f"TRIPPED (熔断): {error_msg}", name)
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE filter_registry SET error=? WHERE name=?",
+                        (error_msg, name)
+                    )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        threading.Thread(target=update_db, daemon=True).start()
+
+    def handle_request(self, flow: Any, uid: str, db: AsyncNetTraceDB) -> None:
+        with self.lock:
+            active_filters = sorted(
+                [f for f in self.filters.values() if f.on_request_fn and not f.is_tripped],
+                key=lambda f: f.priority
+            )
+        if not active_filters:
+            return
+
+        request = getattr(flow, "request", None)
+        if request is None:
+            return
+
+        for filt in active_filters:
+            pre_url = str(request.url)
+            pre_headers = dict(request.headers)
+            pre_body_len = len(request.raw_content or b"")
+            had_response = getattr(flow, "response", None) is not None
+
+            t0 = time.perf_counter()
+            error_str = None
+            status = "SUCCESS"
+            action = "PASSTHROUGH"
+
+            try:
+                result = filt.on_request_fn(flow)
+                filt.consecutive_errors = 0
+            except Exception as exc:
+                filt.consecutive_errors += 1
+                status = "ERROR"
+                error_str = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-500:]}"
+                if filt.consecutive_errors >= 3:
+                    filt.is_tripped = True
+                    self._record_filter_error(filt.name, f"Consecutive errors limit reached: {exc}", trip=True)
+
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
+
+            # Analyze action & diff
+            if status == "SUCCESS":
+                has_response = getattr(flow, "response", None) is not None
+                is_killed = bool(getattr(flow, "error", None) and "killed" in str(getattr(flow, "error", "")).lower())
+
+                if not had_response and has_response:
+                    action = "MOCK"
+                elif is_killed:
+                    action = "BLOCK"
+                elif str(request.url) != pre_url or dict(request.headers) != pre_headers or len(request.raw_content or b"") != pre_body_len:
+                    action = "REWRITE"
+                elif isinstance(result, dict) and "action" in result:
+                    action = str(result["action"]).upper()
+
+            diff = {
+                "url_changed": str(request.url) != pre_url,
+                "old_url": pre_url if str(request.url) != pre_url else None,
+                "new_url": str(request.url) if str(request.url) != pre_url else None,
+                "header_count_delta": len(request.headers) - len(pre_headers),
+                "body_len_delta": len(request.raw_content or b"") - pre_body_len,
+            }
+            if getattr(flow, "response", None):
+                diff["mocked_status"] = flow.response.status_code
+
+            # Log hit if action is taken or filter errored
+            if action != "PASSTHROUGH" or status == "ERROR":
+                db.add_filter_hit({
+                    "ts": time.time(),
+                    "flow_uid": uid,
+                    "filter_name": filt.name,
+                    "hook_type": "request",
+                    "action": action,
+                    "target_url": pre_url,
+                    "diff_summary": json_text(diff),
+                    "execution_time_ms": elapsed_ms,
+                    "status": status,
+                    "error": error_str,
+                })
+
+            # If request was mocked or blocked, do not continue filter chain
+            if getattr(flow, "response", None) is not None or getattr(flow, "error", None) is not None:
+                break
+
+    def handle_response(self, flow: Any, uid: str, db: AsyncNetTraceDB) -> None:
+        with self.lock:
+            active_filters = sorted(
+                [f for f in self.filters.values() if f.on_response_fn and not f.is_tripped],
+                key=lambda f: f.priority
+            )
+        if not active_filters:
+            return
+
+        response = getattr(flow, "response", None)
+        if response is None:
+            return
+
+        for filt in active_filters:
+            pre_status = response.status_code
+            pre_headers = dict(response.headers)
+            pre_body_len = len(response.raw_content or b"")
+
+            t0 = time.perf_counter()
+            error_str = None
+            status = "SUCCESS"
+            action = "PASSTHROUGH"
+
+            try:
+                result = filt.on_response_fn(flow)
+                filt.consecutive_errors = 0
+            except Exception as exc:
+                filt.consecutive_errors += 1
+                status = "ERROR"
+                error_str = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-500:]}"
+                if filt.consecutive_errors >= 3:
+                    filt.is_tripped = True
+                    self._record_filter_error(filt.name, f"Consecutive errors limit reached: {exc}", trip=True)
+
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
+
+            if status == "SUCCESS":
+                if response.status_code != pre_status or dict(response.headers) != pre_headers or len(response.raw_content or b"") != pre_body_len:
+                    action = "REWRITE"
+                elif isinstance(result, dict) and "action" in result:
+                    action = str(result["action"]).upper()
+
+            diff = {
+                "status_code_changed": response.status_code != pre_status,
+                "old_status": pre_status if response.status_code != pre_status else None,
+                "new_status": response.status_code if response.status_code != pre_status else None,
+                "body_len_delta": len(response.raw_content or b"") - pre_body_len,
+            }
+
+            if action != "PASSTHROUGH" or status == "ERROR":
+                target_url = str(flow.request.url) if getattr(flow, "request", None) else ""
+                db.add_filter_hit({
+                    "ts": time.time(),
+                    "flow_uid": uid,
+                    "filter_name": filt.name,
+                    "hook_type": "response",
+                    "action": action,
+                    "target_url": target_url,
+                    "diff_summary": json_text(diff),
+                    "execution_time_ms": elapsed_ms,
+                    "status": status,
+                    "error": error_str,
+                })
+
+
 class NetTraceAddon:
     def __init__(self) -> None:
         self.db: AsyncNetTraceDB | None = None
+        self.filter_manager: FilterManager | None = None
         self.session_id = ""
         self.label = "capture"
         self.started: dict[str, float] = {}
@@ -94,6 +359,8 @@ class NetTraceAddon:
         self.db_path = path
         self.label = ctx.options.nettrace_label or "capture"
         self.db = AsyncNetTraceDB(path)
+        self.filter_manager = FilterManager(path)
+        self.filter_manager.sync_from_db()
         version = "unknown"
         try:
             from importlib.metadata import version as package_version
@@ -123,6 +390,11 @@ class NetTraceAddon:
                 continue
             with self.capture_state_lock:
                 self.capture_state = state
+            if self.filter_manager:
+                try:
+                    self.filter_manager.sync_from_db()
+                except Exception:
+                    pass
 
     def _is_listening(self) -> bool:
         with self.capture_state_lock:
@@ -237,16 +509,31 @@ class NetTraceAddon:
         self._require_db().finish_conn(uid, max(0.0, end - start), state, error)
         self.ensured.discard(uid)
 
+    def request(self, flow) -> None:
+        if not self._is_listening():
+            return
+        uid = flow_uid(flow)
+        if self.filter_manager:
+            try:
+                self.filter_manager.handle_request(flow, uid, self._require_db())
+            except Exception as exc:
+                safe_log(f"Error handling request filter: {exc}", "warn")
+
     def response(self, flow) -> None:
         if not self._is_listening():
             return
+        uid = self._ensure_conn(flow, "tcp", getattr(flow, "timestamp_start", None))
+        if uid is None:
+            return
+        if self.filter_manager:
+            try:
+                self.filter_manager.handle_response(flow, uid, self._require_db())
+            except Exception as exc:
+                safe_log(f"Error handling response filter: {exc}", "warn")
         request = flow.request
         response = flow.response
         request_body = bytes(request.raw_content) if request and request.raw_content is not None else None
         response_body = bytes(response.raw_content) if response and response.raw_content is not None else None
-        uid = self._ensure_conn(flow, "tcp", getattr(flow, "timestamp_start", None))
-        if uid is None:
-            return
         orig_h, orig_p, resp_h, resp_p = addresses(flow)
         row = {
             "uid": uid,

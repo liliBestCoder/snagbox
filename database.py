@@ -152,6 +152,34 @@ CREATE TABLE IF NOT EXISTS udp_message (
 );
 CREATE INDEX IF NOT EXISTS idx_udp_message_uid ON udp_message(uid, message_index);
 
+CREATE TABLE IF NOT EXISTS filter_registry (
+    name TEXT PRIMARY KEY,
+    code TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    priority INTEGER NOT NULL DEFAULT 100,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS filter_hits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    flow_uid TEXT NOT NULL,
+    filter_name TEXT NOT NULL,
+    hook_type TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    diff_summary TEXT,
+    execution_time_ms REAL NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_filter_hits_ts ON filter_hits(ts);
+CREATE INDEX IF NOT EXISTS idx_filter_hits_uid ON filter_hits(flow_uid);
+CREATE INDEX IF NOT EXISTS idx_filter_hits_name ON filter_hits(filter_name);
+
 CREATE TRIGGER IF NOT EXISTS capture_conn_insert_guard BEFORE INSERT ON conn
 WHEN (SELECT state FROM capture_control WHERE singleton_id=1) != 'listening'
 BEGIN SELECT RAISE(IGNORE); END;
@@ -179,6 +207,8 @@ TABLE_DESCRIPTIONS = {
     "dns": "Zeek dns.log 风格的 DNS 查询与响应。",
     "tcp_message": "扩展表：mitmproxy 收到的 TCP 字节块；未信任根证书时可包含加密 TLS 隧道字节；块边界不等于协议消息边界。",
     "udp_message": "扩展表：mitmproxy 收到的独立 UDP datagram。",
+    "filter_registry": "动态 Filter 插件注册表；记录 Agent 安装的代码、优先级与启用状态。",
+    "filter_hits": "Filter 命中日志；记录哪个 Filter 在何时拦截了哪个请求、执行动作与详细 diff 修改摘要。",
 }
 
 
@@ -200,6 +230,11 @@ class NetTraceDB:
         ):
             if column not in http_columns:
                 self.conn.execute(f"ALTER TABLE http ADD COLUMN {column} {column_type}")
+
+        registry_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(filter_registry)")}
+        if "description" not in registry_columns:
+            self.conn.execute("ALTER TABLE filter_registry ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+
         self.conn.commit()
 
     def start_session(self, label: str, mitmproxy_version: str = "unknown", notes: str = "") -> str:
@@ -310,6 +345,16 @@ class NetTraceDB:
         self.conn.execute(f"INSERT OR REPLACE INTO dns ({','.join(cols)}) VALUES ({placeholders})", values)
         self.conn.commit()
 
+    def add_filter_hit(self, row: dict[str, Any]) -> None:
+        cols = [
+            "ts", "flow_uid", "filter_name", "hook_type", "action",
+            "target_url", "diff_summary", "execution_time_ms", "status", "error"
+        ]
+        values = [row.get(c) for c in cols]
+        placeholders = ",".join("?" for _ in cols)
+        self.conn.execute(f"INSERT INTO filter_hits ({','.join(cols)}) VALUES ({placeholders})", values)
+        self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()
 
@@ -413,6 +458,9 @@ class AsyncNetTraceDB:
 
     def add_dns(self, *args: Any, **kwargs: Any) -> bool:
         return self._submit("add_dns", *args, **kwargs)
+
+    def add_filter_hit(self, *args: Any, **kwargs: Any) -> bool:
+        return self._submit("add_filter_hit", *args, **kwargs)
 
     def finish_session(self, *args: Any, **kwargs: Any) -> bool:
         return self._submit("finish_session", *args, **kwargs)

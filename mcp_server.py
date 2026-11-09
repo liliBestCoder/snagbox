@@ -178,7 +178,7 @@ def _ghost_request(
     host, port, token = _ghost_api
     conn = http.client.HTTPConnection(host, port, timeout=4.0)
     try:
-        payload = None if body is None else json.dumps(body, ensure_ascii=False)
+        payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {"X-Ghost-Plugin-Token": token, "Accept": "application/json"}
         if payload is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -218,113 +218,93 @@ def _ghost_request(
         conn.close()
 
 
-def _ghost_process_stats() -> dict[str, Any]:
-    # Ghost's default process-stats response repeats large base64 icons for each
-    # process and group. iconRefs=1 sends each distinct icon once; the larger
-    # bounded limit accommodates hosts with many injected processes.
-    return _ghost_request(
-        "GET", "/process-stats?iconRefs=1",
-        max_response_bytes=MAX_GHOST_PROCESS_STATS_BYTES,
-    )
+def ghost_log(message: str, level: str = "info", fields: dict[str, Any] | None = None) -> None:
+    """Ingest plugin execution logs into Ghost Proxifier system log."""
+    if _ghost_api is None:
+        return
+    try:
+        payload: dict[str, Any] = {"level": level, "message": message}
+        if fields:
+            payload["fields"] = fields
+        _ghost_request("POST", "/api/plugin/v1/log/ingest", payload)
+    except Exception:
+        pass
+
+
+def ghost_toast(title: str, message: str, level: str = "info") -> None:
+    """Send a safe plain-text toast notification to Ghost Proxifier host UI."""
+    if _ghost_api is None:
+        return
+    try:
+        _ghost_request("POST", "/api/plugin/v1/ui/toast", {
+            "title": title,
+            "message": message,
+            "level": level,
+        })
+    except Exception:
+        pass
 
 
 def _ensure_snagbox_upstream(proxy_port: int) -> dict[str, Any]:
-    """Use Ghost's generic config read/write APIs to keep one named node."""
-    config = _ghost_request("GET", "/config")
-    if config.get("status") == "error" or not isinstance(config.get("upstream"), list):
-        return {"status": "error", "error": config.get("error", "config_read_failed")}
-    upstream = config["upstream"]
-    matches = [i for i, node in enumerate(upstream)
-               if isinstance(node, dict) and str(node.get("name", "")).casefold() == "snagbox"]
-    canonical_id = ""
-    changed = False
-    duplicate_ids: set[str] = set()
-    if matches:
-        chosen = next((i for i in matches if upstream[i].get("id") == "snagbox"), matches[0])
-        node = upstream[chosen]
-        canonical_id = str(node.get("id") or "")
-        if not canonical_id:
-            canonical_id = "snagbox"
-            used = {str(x.get("id", "")) for x in upstream if isinstance(x, dict)}
-            suffix = 0
-            while canonical_id in used:
-                suffix += 1
-                canonical_id = f"snagbox-{suffix}"
-        active = any(bool(upstream[i].get("active", False)) for i in matches)
-        for i in matches:
-            if i != chosen:
-                dup_id = str(upstream[i].get("id", ""))
-                if dup_id and dup_id != canonical_id:
-                    duplicate_ids.add(dup_id)
-        fixed = dict(node)
-        fixed.update({"id": canonical_id, "name": "snagbox", "type": "HTTP",
-                      "addr": f"127.0.0.1:{proxy_port}", "user": "", "pass": "",
-                      "active": active, "builtin": False})
-        if fixed.get("addr") != node.get("addr") or fixed.get("type") != node.get("type"):
-            fixed.pop("udpRelay", None)
-        if fixed != node or len(matches) > 1:
-            changed = True
-        upstream[chosen] = fixed
-        for i in reversed(matches):
-            if i != chosen:
-                del upstream[i]
-    else:
-        ids = {str(x.get("id", "")) for x in upstream if isinstance(x, dict)}
-        canonical_id = "snagbox"
-        suffix = 0
-        while canonical_id in ids:
-            suffix += 1
-            canonical_id = f"snagbox-{suffix}"
-        upstream.append({"id": canonical_id, "name": "snagbox", "type": "HTTP",
-                         "addr": f"127.0.0.1:{proxy_port}", "user": "", "pass": "",
-                         "icon": "default.png", "active": False, "builtin": False})
-        changed = True
-    if changed:
-        saved = _ghost_request("POST", "/save-config", config)
-        if saved.get("status") not in ("saved", "ok"):
-            return {"status": "error", "error": saved.get("error", "config_write_failed")}
-        if duplicate_ids:
-            _migrate_duplicate_upstream_targets(duplicate_ids, canonical_id)
-    return {"status": "ok", "nodeId": canonical_id, "changed": changed,
-            "duplicatesRemoved": len(duplicate_ids)}
+    """Ensure a dedicated snagbox upstream node exists via ghost.upstream.v1 API."""
+    list_res = _ghost_request("GET", "/api/plugin/v1/upstream/list")
+    if list_res.get("status") == "error":
+        return {"status": "error", "error": list_res.get("error", "upstream_list_failed")}
 
-
-def _migrate_duplicate_upstream_targets(duplicate_ids: set[str], canonical_id: str) -> None:
-    stats = _ghost_process_stats()
-    for group in stats.get("groups", []) if isinstance(stats.get("groups"), list) else []:
-        if not isinstance(group, dict) or str(group.get("nodeId", "")) not in duplicate_ids:
+    nodes = list_res.get("nodes", []) if isinstance(list_res.get("nodes"), list) else []
+    target_node = None
+    for node in nodes:
+        if not isinstance(node, dict):
             continue
-        target_id = str(group.get("id", ""))
-        if target_id:
-            _ghost_request("POST", "/api/update-target-config", {"id": target_id, "nodeId": canonical_id})
+        if node.get("name") == "snagbox":
+            host = node.get("host")
+            port = node.get("port")
+            if host in ("127.0.0.1", "localhost") and port == proxy_port and str(node.get("type", "")).lower() == "http":
+                target_node = node
+                break
+            else:
+                old_id = node.get("id")
+                if old_id:
+                    _ghost_request("POST", "/api/plugin/v1/upstream/delete", {"nodeId": old_id})
+
+    if target_node and target_node.get("id"):
+        return {"status": "ok", "nodeId": target_node["id"], "reused": True}
+
+    create_res = _ghost_request("POST", "/api/plugin/v1/upstream/create", {
+        "name": "snagbox",
+        "type": "http",
+        "host": "127.0.0.1",
+        "port": proxy_port,
+    })
+    if create_res.get("status") != "ok" or not create_res.get("nodeId"):
+        return {"status": "error", "error": create_res.get("error", "upstream_create_failed"), "detail": create_res}
+
+    return {"status": "ok", "nodeId": create_res["nodeId"], "reused": False}
 
 
-def _list_snagbox_groups() -> dict[str, Any]:
+def _list_snagbox_targets() -> dict[str, Any]:
+    """List plugin-owned targets from Ghost Target API."""
     if not _snagbox_node_id:
         return {"error": "snagbox_upstream_unavailable"}
-    response = _ghost_process_stats()
-    if response.get("error") or not isinstance(response.get("groups"), list):
-        return {"error": response.get("error", "process_list_failed"), "detail": response.get("detail")}
-    groups = response.get("groups", [])
-    targets = [group for group in groups if isinstance(group, dict)
-               and str(group.get("nodeId", "")) == _snagbox_node_id]
+    res = _ghost_request("GET", "/api/plugin/v1/targets/list")
+    if res.get("status") != "ok" or not isinstance(res.get("targets"), list):
+        return {"error": res.get("error", "targets_list_failed"), "detail": res.get("detail")}
+    targets = [
+        t for t in res.get("targets", [])
+        if isinstance(t, dict) and (not _snagbox_node_id or t.get("proxyNodeId") == _snagbox_node_id)
+    ]
     return {"status": "ok", "nodeId": _snagbox_node_id, "targets": targets}
-
-
-def _ensure_target_dot(target_id: str) -> dict[str, Any]:
-    """Keep the saved Ghost target configuration on the DOT DNS mode."""
-    return _ghost_request("POST", "/api/update-target-config", {"id": target_id, "dnsMode": "dot"})
 
 
 @mcp.tool()
 def list_snagbox_processes() -> dict[str, Any]:
-    """List Ghost process groups currently routed through the snagbox upstream."""
-    return _list_snagbox_groups()
+    """List Ghost targets currently configured or running under snagbox upstream."""
+    return _list_snagbox_targets()
 
 
 @mcp.tool()
 def start_snagbox_program(target_path: str, arguments: str = "") -> dict[str, Any]:
-    """Reuse a snagbox target group by executable path, creating one only when absent."""
+    """Launch or resume a program routed through snagbox via Ghost Target API."""
     if not isinstance(target_path, str) or not target_path.strip() or not isinstance(arguments, str):
         return {"error": "invalid_arguments"}
     if not _snagbox_node_id:
@@ -334,96 +314,164 @@ def start_snagbox_program(target_path: str, arguments: str = "") -> dict[str, An
         return {"error": "target_path_must_be_absolute", "target_path": target_path}
     if not path.is_file():
         return {"error": "target_executable_not_found", "target_path": str(path)}
-    target = str(path.resolve())
+    target_abs = str(path.resolve())
 
-    stats = _ghost_process_stats()
-    if stats.get("error") or not isinstance(stats.get("groups"), list):
-        return {"error": stats.get("error", "process_list_failed"),
-                "detail": stats.get("detail", "Ghost returned no target groups")}
+    list_res = _ghost_request("GET", "/api/plugin/v1/targets/list")
+    if list_res.get("status") != "ok" or not isinstance(list_res.get("targets"), list):
+        return {"error": list_res.get("error", "targets_list_failed"), "detail": list_res.get("detail")}
 
-    target_key = target.replace("/", "\\").casefold()
-    matches = [group for group in stats["groups"]
-               if isinstance(group, dict)
-               and str(group.get("nodeId", "")) == _snagbox_node_id
-               and str(group.get("path", "")).replace("/", "\\").casefold() == target_key]
-    # Prefer the live group when earlier starts left duplicate entries; otherwise
-    # reuse a stopped group. Both cases avoid adding another Ghost target group.
-    def _active_count(group: dict[str, Any]) -> int:
-        try:
-            return int(group.get("activeCount", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+    target_name = path.name
+    existing = None
+    for t in list_res["targets"]:
+        if not isinstance(t, dict):
+            continue
+        env_exe = t.get("env", {}).get("SNAGBOX_EXE_PATH") if isinstance(t.get("env"), dict) else None
+        if env_exe and Path(env_exe).resolve() == Path(target_abs).resolve():
+            existing = t
+            break
+        if str(t.get("name", "")).casefold() in (target_name.casefold(), target_abs.casefold()):
+            existing = t
+            break
 
-    existing = next((group for group in matches if _active_count(group) > 0), None)
-    if existing is None and matches:
-        existing = matches[0]
+    args_list = arguments.split() if arguments.strip() else []
+
     if existing is not None:
-        target_id = str(existing.get("id", ""))
+        target_id = existing.get("targetId")
         if not target_id:
-            return {"error": "target_group_missing_id", "path": target}
-        # Avoid a permission-gated no-op write: Ghost may reject target config
-        # writes even when the saved DNS mode is already DOT.
-        if str(existing.get("dnsMode", "")).casefold() != "dot":
-            configured = _ensure_target_dot(target_id)
-            if configured.get("status") != "ok":
-                return {"error": configured.get("error", "dns_config_update_failed"),
-                        "detail": configured.get("detail"), "targetId": target_id}
-        if _active_count(existing) > 0:
-            return {"status": "ok", "nodeId": _snagbox_node_id, "path": target,
-                    "targetId": target_id, "reusedTargetGroup": True,
-                    "alreadyRunning": True, "startedNewProcess": False,
-                    "dnsMode": "dot", "dnsConfigUpdated": True,
-                    "activeProcessMayNeedRestart": True}
-        # The plugin's target.launch grant authorizes Ghost's generic /inject
-        # API (target.add). Supplying the existing GUID makes Ghost relaunch
-        # that saved target instead of creating a duplicate process group.
-        result = _ghost_request("POST", "/inject", {
-            "target": target, "arguments": arguments, "nodeId": _snagbox_node_id,
-            "mode": "manual", "dnsMode": "dot", "sync": False, "guid": target_id
-        })
-        if result.get("status") != "ok":
-            return {"error": result.get("error", "launch_failed"), "detail": result.get("detail"),
-                    "targetId": target_id}
-        return {"status": "ok", "nodeId": _snagbox_node_id, "path": target,
-                "targetId": target_id, "reusedTargetGroup": True,
-                "alreadyRunning": False, "startedNewProcess": True,
-                "dnsMode": "dot", "dnsConfigUpdated": True, "ghost": result}
+            return {"error": "target_missing_id"}
 
-    result = _ghost_request("POST", "/inject", {
-        "target": target, "arguments": arguments, "nodeId": _snagbox_node_id,
-        "mode": "manual", "dnsMode": "dot", "sync": False
+        if existing.get("proxyNodeId") != _snagbox_node_id or str(existing.get("dnsMode", "")).casefold() != "dot":
+            _ghost_request("POST", "/api/plugin/v1/targets/update", {
+                "targetId": target_id,
+                "proxyNodeId": _snagbox_node_id,
+                "dnsMode": "dot",
+            })
+
+        if existing.get("status") == "running":
+            return {
+                "status": "ok",
+                "nodeId": _snagbox_node_id,
+                "path": target_abs,
+                "targetId": target_id,
+                "reusedTargetGroup": True,
+                "alreadyRunning": True,
+                "startedNewProcess": False,
+                "dnsMode": "dot",
+                "pid": existing.get("pid"),
+            }
+
+        launch_res = _ghost_request("POST", "/api/plugin/v1/targets/launch", {"targetId": target_id})
+        if launch_res.get("status") != "ok":
+            return {
+                "error": launch_res.get("error", "launch_failed"),
+                "detail": launch_res.get("detail"),
+                "targetId": target_id,
+            }
+
+        ghost_toast("进程已启动", f"已成功启动 {target_name} 并接入流量采集。")
+        ghost_log(f"Launched target {target_name} (ID: {target_id}) routed via snagbox.")
+        return {
+            "status": "ok",
+            "nodeId": _snagbox_node_id,
+            "path": target_abs,
+            "targetId": target_id,
+            "reusedTargetGroup": True,
+            "alreadyRunning": False,
+            "startedNewProcess": True,
+            "dnsMode": "dot",
+            "ghost": launch_res,
+        }
+
+    create_res = _ghost_request("POST", "/api/plugin/v1/targets/create", {
+        "name": target_name,
+        "exePath": target_abs,
+        "args": args_list,
+        "proxyNodeId": _snagbox_node_id,
+        "dnsMode": "dot",
+        "env": {
+            "SNAGBOX_MANAGED": "1",
+            "SNAGBOX_EXE_PATH": target_abs,
+        },
     })
-    if result.get("status") != "ok":
-        return {"error": result.get("error", "launch_failed"), "detail": result.get("detail")}
-    return {"status": "ok", "nodeId": _snagbox_node_id, "path": target,
-            "startedNewProcess": True, "reusedTargetGroup": False,
-            "dnsMode": "dot", "ghost": result}
+    if create_res.get("status") != "ok" or not create_res.get("targetId"):
+        return {
+            "error": create_res.get("error", "target_create_failed"),
+            "detail": create_res.get("detail"),
+        }
+
+    target_id = create_res["targetId"]
+    launch_res = _ghost_request("POST", "/api/plugin/v1/targets/launch", {"targetId": target_id})
+    if launch_res.get("status") != "ok":
+        return {
+            "error": launch_res.get("error", "launch_failed"),
+            "detail": launch_res.get("detail"),
+            "targetId": target_id,
+        }
+
+    ghost_toast("进程已创建并启动", f"已成功创建并启动 {target_name}。")
+    ghost_log(f"Created and launched new target {target_name} (ID: {target_id}) routed via snagbox.")
+    return {
+        "status": "ok",
+        "nodeId": _snagbox_node_id,
+        "path": target_abs,
+        "targetId": target_id,
+        "startedNewProcess": True,
+        "reusedTargetGroup": False,
+        "dnsMode": "dot",
+        "ghost": launch_res,
+    }
 
 
 @mcp.tool()
 def stop_snagbox_program(process_name: str) -> dict[str, Any]:
-    """Stop matching processes only inside Ghost groups using the snagbox node."""
+    """Stop matching targets only inside snagbox-managed targets."""
     if not isinstance(process_name, str) or not process_name.strip():
         return {"error": "process_name_required"}
     query = Path(process_name.strip()).name.casefold()
-    groups = _list_snagbox_groups()
-    if "error" in groups:
-        return groups
-    matched: list[int] = []
+    raw_query = process_name.strip().casefold()
+
+    list_res = _ghost_request("GET", "/api/plugin/v1/targets/list")
+    if list_res.get("status") != "ok" or not isinstance(list_res.get("targets"), list):
+        return {"error": list_res.get("error", "targets_list_failed")}
+
+    matched_targets = []
+    for t in list_res["targets"]:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("targetId", "")).casefold()
+        tname = str(t.get("name", "")).casefold()
+        tfile = Path(str(t.get("name", ""))).name.casefold()
+        env_exe = ""
+        if isinstance(t.get("env"), dict):
+            env_exe = Path(str(t["env"].get("SNAGBOX_EXE_PATH", ""))).name.casefold()
+
+        if query in (tid, tname, tfile, env_exe) or raw_query in (tid, tname):
+            matched_targets.append(t)
+
+    stopped_ids: list[str] = []
     errors: list[dict[str, Any]] = []
-    for group in groups.get("targets", []):
-        for proc in group.get("children", []) if isinstance(group.get("children"), list) else []:
-            pid = proc.get("pid") if isinstance(proc, dict) else None
-            name = Path(str(proc.get("name", ""))).name.casefold() if isinstance(proc, dict) else ""
-            if not isinstance(pid, int) or pid <= 0 or name != query:
-                continue
-            result = _ghost_request("POST", "/api/kill-process-tree", {"pid": pid})
-            if result.get("status") == "ok":
-                matched.append(pid)
-            else:
-                errors.append({"pid": pid, "error": result.get("error", "process_stop_failed")})
-    return {"status": "ok" if not errors else "partial", "processName": query,
-            "matched": len(matched) + len(errors), "stoppedPids": matched, "errors": errors}
+
+    for t in matched_targets:
+        tid = t.get("targetId")
+        if not tid:
+            continue
+        stop_res = _ghost_request("POST", "/api/plugin/v1/targets/stop", {"targetId": tid})
+        if stop_res.get("status") == "ok":
+            stopped_ids.append(tid)
+        else:
+            errors.append({"targetId": tid, "error": stop_res.get("error", "target_stop_failed")})
+
+    if stopped_ids:
+        ghost_toast("进程已停止", f"已停止 {len(stopped_ids)} 个 snagbox 目标。")
+        ghost_log(f"Stopped {len(stopped_ids)} target(s): {', '.join(stopped_ids)}.")
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "processName": query,
+        "matched": len(matched_targets),
+        "stoppedTargetIds": stopped_ids,
+        "errors": errors,
+    }
 
 
 def _open() -> sqlite3.Connection:
@@ -771,6 +819,369 @@ def _clear_capture_data() -> dict[str, Any]:
         return {"error": "sqlite_error", "detail": str(exc)[:1000]}
     finally:
         conn.close()
+
+
+@mcp.tool()
+def install_filter(name: str, code: str, description: str = "", priority: int = 100) -> dict[str, Any]:
+    """Install or update a dynamic Python filter for request/response rewriting, mocking, or blocking.
+
+    [Arguments]:
+    - `name`: Unique alphanumeric identifier for this filter (e.g. 'auto_sign_v1', 'mock_user_profile')
+    - `code`: The complete Python code defining `on_request(flow)` and/or `on_response(flow)`
+    - `description`: Clear summary of what this filter does (e.g. 'Injects HMAC signature into /api/v1 headers')
+    - `priority`: Execution order (lower integer executes earlier; default 100)
+
+    [Execution Environment & Pre-injected Modules]:
+    The filter executes in a secure sandbox with the following modules pre-injected globally (do NOT re-import):
+    - `http`: mitmproxy.http module (use http.Response.make(status, content, headers) for mocking)
+    - `json`: standard json library
+    - `re`: regular expressions (for URL matching and text parsing)
+    - `base64`: base64 encoding/decoding
+    - `hashlib`: md5, sha1, sha256 hashing (for calculating signatures)
+    - `hmac`: keyed-hashing for message authentication
+    - `random`: random number and string generation
+    - `time`: time and timestamps
+    - `urlparse`: urllib.parse module
+
+    [Required Functions]:
+    The script MUST define at least one of these two functions:
+    1. `def on_request(flow):`
+       - Modify headers: `flow.request.headers["X-Custom"] = "val"`
+       - Modify query: `flow.request.query["param"] = "val"`
+       - Modify text/body: `flow.request.text = json.dumps(...)`
+       - Mock response (short-circuit network):
+         `flow.response = http.Response.make(200, b'{"mock": true}', {"Content-Type": "application/json"})`
+       - Block request: `flow.kill()`
+    2. `def on_response(flow):`
+       - Modify status code: `flow.response.status_code = 200`
+       - Modify response headers or body: `flow.response.text = '{"tampered": true}'`
+
+    [Disallowed Modules]:
+    Importing system-level modules (os, subprocess, sys, shutil, socket, ctypes) is strictly forbidden and rejected.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return {"error": "filter_name_required"}
+    name = name.strip()
+    if not isinstance(code, str) or not code.strip():
+        return {"error": "filter_code_required"}
+
+    # AST syntax and safety check
+    import ast
+    try:
+        parsed = ast.parse(code, filename=f"<filter:{name}>")
+    except SyntaxError as exc:
+        return {"error": "syntax_error", "detail": str(exc), "lineno": exc.lineno}
+
+    for node in ast.walk(parsed):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [alias.name.split(".")[0] for alias in node.names]
+            for n in names:
+                if n in {"os", "subprocess", "sys", "shutil", "socket", "ctypes"}:
+                    return {"error": "disallowed_module", "detail": f"Importing '{n}' is forbidden in filters"}
+
+    has_request_hook = any(
+        isinstance(n, ast.FunctionDef) and n.name == "on_request" for n in parsed.body
+    )
+    has_response_hook = any(
+        isinstance(n, ast.FunctionDef) and n.name == "on_response" for n in parsed.body
+    )
+    if not (has_request_hook or has_response_hook):
+        return {
+            "error": "missing_hooks",
+            "detail": "Filter must define at least 'on_request(flow)' or 'on_response(flow)' function",
+        }
+
+    conn = _open_control()
+    try:
+        conn.execute(
+            """
+            INSERT INTO filter_registry(name, code, description, priority, enabled, created_at, updated_at, error)
+            VALUES (?, ?, ?, ?, 1, strftime('%s','now'), strftime('%s','now'), NULL)
+            ON CONFLICT(name) DO UPDATE SET
+                code=excluded.code,
+                description=excluded.description,
+                priority=excluded.priority,
+                enabled=1,
+                updated_at=strftime('%s','now'),
+                error=NULL
+            """,
+            (name, code, description.strip(), priority),
+        )
+        conn.commit()
+        return {
+            "status": "ok",
+            "filter_name": name,
+            "description": description.strip(),
+            "priority": priority,
+            "enabled": True,
+            "hooks": {
+                "on_request": has_request_hook,
+                "on_response": has_response_hook,
+            },
+        }
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return {"error": "sqlite_error", "detail": str(exc)[:1000]}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_filters() -> dict[str, Any]:
+    """List all installed dynamic filters with their status, hit counts, and execution metrics."""
+    conn = _open()
+    try:
+        rows = conn.execute(
+            """
+            SELECT r.name, r.code, r.description, r.priority, r.enabled, r.created_at, r.updated_at, r.error,
+                   COUNT(h.id) AS total_hits,
+                   MAX(h.ts) AS last_hit_ts,
+                   SUM(CASE WHEN h.status = 'ERROR' THEN 1 ELSE 0 END) AS error_hits
+            FROM filter_registry r
+            LEFT JOIN filter_hits h ON r.name = h.filter_name
+            GROUP BY r.name
+            ORDER BY r.priority ASC, r.name ASC
+            """
+        ).fetchall()
+        filters = []
+        for r in rows:
+            filters.append({
+                "name": r["name"],
+                "description": r["description"] or "",
+                "priority": r["priority"],
+                "enabled": bool(r["enabled"]),
+                "total_hits": r["total_hits"] or 0,
+                "error_hits": r["error_hits"] or 0,
+                "last_hit_ts": r["last_hit_ts"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "error": r["error"],
+                "code_preview": r["code"][:200] + ("..." if len(r["code"]) > 200 else ""),
+            })
+        return {"filters": filters, "total": len(filters)}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_filter_hits(
+    filter_name: str | None = None,
+    action: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Retrieve recent filter interception records (Mock, Rewrite, Block, Tag) with diff summaries.
+
+    [Arguments]:
+    - `filter_name`: Optional filter name to narrow down hits (e.g. 'auto_sign_v1')
+    - `action`: Optional action filter ('MOCK', 'REWRITE', 'BLOCK', 'TAG')
+    - `limit`: Maximum number of records to return (1-200, default 20)
+    """
+    limit = max(1, min(int(limit), 200))
+    clauses = []
+    params: list[Any] = []
+    if filter_name and filter_name.strip():
+        clauses.append("filter_name = ?")
+        params.append(filter_name.strip())
+    if action and action.strip():
+        clauses.append("action = ?")
+        params.append(action.strip().upper())
+
+    where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT id, ts, flow_uid, filter_name, hook_type, action, target_url, diff_summary, execution_time_ms, status, error
+        FROM filter_hits
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ?
+    """
+    params.append(limit)
+
+    conn = _open()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        hits = []
+        for r in rows:
+            diff_obj = None
+            if r["diff_summary"]:
+                try:
+                    diff_obj = json.loads(r["diff_summary"])
+                except Exception:
+                    diff_obj = r["diff_summary"]
+
+            hits.append({
+                "hit_id": r["id"],
+                "timestamp": r["ts"],
+                "flow_uid": r["flow_uid"],
+                "filter_name": r["filter_name"],
+                "hook_type": r["hook_type"],
+                "action": r["action"],
+                "target_url": r["target_url"],
+                "diff": diff_obj,
+                "execution_time_ms": r["execution_time_ms"],
+                "status": r["status"],
+                "error": r["error"],
+            })
+        return {
+            "hits": hits,
+            "count": len(hits),
+            "filter_name": filter_name,
+            "action": action,
+        }
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def remove_filter(name: str) -> dict[str, Any]:
+    """Remove an installed dynamic filter by name."""
+    if not isinstance(name, str) or not name.strip():
+        return {"error": "filter_name_required"}
+    name = name.strip()
+    conn = _open_control()
+    try:
+        cursor = conn.execute("DELETE FROM filter_registry WHERE name=?", (name,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return {"error": "filter_not_found", "filter_name": name}
+        return {"status": "ok", "removed_filter": name}
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return {"error": "sqlite_error", "detail": str(exc)[:1000]}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def toggle_filter(name: str, enabled: bool) -> dict[str, Any]:
+    """Enable or disable an installed dynamic filter without deleting its code."""
+    if not isinstance(name, str) or not name.strip():
+        return {"error": "filter_name_required"}
+    name = name.strip()
+    conn = _open_control()
+    try:
+        cursor = conn.execute(
+            "UPDATE filter_registry SET enabled=?, updated_at=strftime('%s','now') WHERE name=?",
+            (int(enabled), name),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return {"error": "filter_not_found", "filter_name": name}
+        return {"status": "ok", "filter_name": name, "enabled": bool(enabled)}
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return {"error": "sqlite_error", "detail": str(exc)[:1000]}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def replay_request(uid: str, modifications: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Replay an HTTP request previously recorded in the 'http' table by uid, optionally applying modifications.
+    Modifications can override: 'method', 'uri', 'headers' (dict), or 'body' (str).
+    """
+    if not isinstance(uid, str) or not uid.strip():
+        return {"error": "uid_required"}
+    uid = uid.strip()
+
+    conn = _open()
+    try:
+        row = conn.execute(
+            "SELECT method, host, uri, request_headers, request_body FROM http WHERE uid=?",
+            (uid,),
+        ).fetchone()
+        if row is None:
+            return {"error": "request_not_found", "uid": uid}
+        method = row["method"] or "GET"
+        host = row["host"] or ""
+        uri = row["uri"] or "/"
+        raw_headers = row["request_headers"]
+        raw_body = row["request_body"]
+    finally:
+        conn.close()
+
+    # Parse headers
+    headers: dict[str, str] = {}
+    if raw_headers:
+        try:
+            pairs = json.loads(raw_headers)
+            if isinstance(pairs, list):
+                for item in pairs:
+                    if isinstance(item, list) and len(item) == 2:
+                        headers[str(item[0])] = str(item[1])
+        except Exception:
+            pass
+
+    # Remove hop-by-hop headers
+    for h in ("Host", "Content-Length", "Transfer-Encoding", "Connection"):
+        headers.pop(h, None)
+        headers.pop(h.lower(), None)
+
+    # Apply modifications
+    body = raw_body or b""
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+
+    if modifications and isinstance(modifications, dict):
+        if "method" in modifications:
+            method = str(modifications["method"]).upper()
+        if "uri" in modifications:
+            uri = str(modifications["uri"])
+        if "headers" in modifications and isinstance(modifications["headers"], dict):
+            for k, v in modifications["headers"].items():
+                headers[str(k)] = str(v)
+        if "body" in modifications:
+            new_body = modifications["body"]
+            if isinstance(new_body, str):
+                body = new_body.encode("utf-8")
+            elif isinstance(new_body, bytes):
+                body = new_body
+
+    # Construct target URL
+    scheme = "https" if ":443" in host or not (":80" in host or ":8080" in host) else "http"
+    if uri.startswith("http://") or uri.startswith("https://"):
+        target_url = uri
+    else:
+        target_url = f"{scheme}://{host}{uri}"
+
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(target_url, data=body if method not in ("GET", "HEAD") else None, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            resp_body = resp.read(4096)
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+            return {
+                "status": "ok",
+                "replayed_uid": uid,
+                "target_url": target_url,
+                "method": method,
+                "response_status": resp.status,
+                "response_headers": dict(resp.headers),
+                "response_body_preview": resp_body[:512].decode("utf-8", errors="replace"),
+                "elapsed_ms": elapsed_ms,
+            }
+    except urllib.error.HTTPError as exc:
+        resp_body = exc.read(4096) if hasattr(exc, "read") else b""
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        return {
+            "status": "http_error",
+            "replayed_uid": uid,
+            "target_url": target_url,
+            "response_status": exc.code,
+            "response_body_preview": resp_body[:512].decode("utf-8", errors="replace"),
+            "elapsed_ms": elapsed_ms,
+        }
+    except Exception as exc:
+        return {
+            "status": "network_error",
+            "replayed_uid": uid,
+            "target_url": target_url,
+            "error": str(exc),
+        }
 
 
 def main() -> None:
