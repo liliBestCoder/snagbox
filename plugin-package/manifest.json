@@ -27,6 +27,7 @@
     "ghost.target.v1",
     "ghost.upstream.v1",
     "ghost.ui.v1",
-    "ghost.log.v1"
+    "ghost.log.v1",
+    "ghost.egress.v1"
   ]
 }

@@ -124,12 +124,32 @@ class FilterManager:
         self.db_path = db_path
         self.filters: dict[str, FilterInstance] = {}
         self.lock = threading.Lock()
+        self._active_request_filters: tuple[FilterInstance, ...] = ()
+        self._active_response_filters: tuple[FilterInstance, ...] = ()
+        self._last_state_sig: tuple[int, float] = (-1, -1.0)
+
+    def has_request_filters(self) -> bool:
+        return bool(self._active_request_filters)
+
+    def has_response_filters(self) -> bool:
+        return bool(self._active_response_filters)
 
     def sync_from_db(self) -> None:
         if not self.db_path.exists():
             return
         try:
             conn = readonly_connection(self.db_path)
+            sig_row = conn.execute(
+                "SELECT count(*), COALESCE(max(updated_at), 0) FROM filter_registry WHERE enabled=1"
+            ).fetchone()
+            if not sig_row:
+                conn.close()
+                return
+            count, max_upd = int(sig_row[0]), float(sig_row[1])
+            if (count, max_upd) == self._last_state_sig:
+                conn.close()
+                return
+
             rows = conn.execute(
                 "SELECT name, code, priority, enabled, updated_at, error "
                 "FROM filter_registry WHERE enabled=1 ORDER BY priority ASC, name ASC"
@@ -161,6 +181,16 @@ class FilterManager:
                     del self.filters[name]
                     safe_log(f"Unloaded dynamic filter: {name}", "info")
 
+            self._active_request_filters = tuple(sorted(
+                [f for f in self.filters.values() if f.on_request_fn and not f.is_tripped],
+                key=lambda f: f.priority
+            ))
+            self._active_response_filters = tuple(sorted(
+                [f for f in self.filters.values() if f.on_response_fn and not f.is_tripped],
+                key=lambda f: f.priority
+            ))
+            self._last_state_sig = (count, max_upd)
+
     def _record_filter_error(self, name: str, error_msg: str, trip: bool = False) -> None:
         def update_db():
             try:
@@ -182,19 +212,15 @@ class FilterManager:
         threading.Thread(target=update_db, daemon=True).start()
 
     def handle_request(self, flow: Any, uid: str, db: AsyncNetTraceDB) -> None:
-        with self.lock:
-            active_filters = sorted(
-                [f for f in self.filters.values() if f.on_request_fn and not f.is_tripped],
-                key=lambda f: f.priority
-            )
-        if not active_filters:
+        filters = self._active_request_filters
+        if not filters:
             return
 
         request = getattr(flow, "request", None)
         if request is None:
             return
 
-        for filt in active_filters:
+        for filt in filters:
             pre_url = str(request.url)
             pre_headers = dict(request.headers)
             pre_body_len = len(request.raw_content or b"")
@@ -262,19 +288,15 @@ class FilterManager:
                 break
 
     def handle_response(self, flow: Any, uid: str, db: AsyncNetTraceDB) -> None:
-        with self.lock:
-            active_filters = sorted(
-                [f for f in self.filters.values() if f.on_response_fn and not f.is_tripped],
-                key=lambda f: f.priority
-            )
-        if not active_filters:
+        filters = self._active_response_filters
+        if not filters:
             return
 
         response = getattr(flow, "response", None)
         if response is None:
             return
 
-        for filt in active_filters:
+        for filt in filters:
             pre_status = response.status_code
             pre_headers = dict(response.headers)
             pre_body_len = len(response.raw_content or b"")
@@ -381,7 +403,8 @@ class NetTraceAddon:
         ctx.log.info(f"snagbox capture state: {self.capture_state}")
 
     def _poll_capture_state(self) -> None:
-        while not self.control_stop.wait(0.25):
+        last_filter_sync = 0.0
+        while not self.control_stop.wait(0.5):
             if self.db_path is None:
                 continue
             try:
@@ -390,7 +413,9 @@ class NetTraceAddon:
                 continue
             with self.capture_state_lock:
                 self.capture_state = state
-            if self.filter_manager:
+            now = time.monotonic()
+            if self.filter_manager and (now - last_filter_sync >= 2.0):
+                last_filter_sync = now
                 try:
                     self.filter_manager.sync_from_db()
                 except Exception:
@@ -512,12 +537,13 @@ class NetTraceAddon:
     def request(self, flow) -> None:
         if not self._is_listening():
             return
+        if not self.filter_manager or not self.filter_manager.has_request_filters():
+            return
         uid = flow_uid(flow)
-        if self.filter_manager:
-            try:
-                self.filter_manager.handle_request(flow, uid, self._require_db())
-            except Exception as exc:
-                safe_log(f"Error handling request filter: {exc}", "warn")
+        try:
+            self.filter_manager.handle_request(flow, uid, self._require_db())
+        except Exception as exc:
+            safe_log(f"Error handling request filter: {exc}", "warn")
 
     def response(self, flow) -> None:
         if not self._is_listening():
@@ -525,7 +551,7 @@ class NetTraceAddon:
         uid = self._ensure_conn(flow, "tcp", getattr(flow, "timestamp_start", None))
         if uid is None:
             return
-        if self.filter_manager:
+        if self.filter_manager and self.filter_manager.has_response_filters():
             try:
                 self.filter_manager.handle_response(flow, uid, self._require_db())
             except Exception as exc:
