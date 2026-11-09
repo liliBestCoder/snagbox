@@ -38,6 +38,8 @@ AI Agent：理解意图 → 编写 SQL → 查询 → 检查证据 → 决定下
 |---|---|
 | 指定程序的流量采集 | 通过 Ghost Proxifier 将目标程序的流量路由到茄盒本机代理。 |
 | 结构化本地数据 | 将可识别的 HTTP、DNS、连接和代理层消息记录到 SQLite。 |
+| 动态可插拔 Filter | 支持 Agent 动态生成并热加载 Python 规则，实现请求/响应改写（Rewrite）、Mock 本地短路、阻断（Block）与请求重放（Replay）。 |
+| 拦截命中与 Diff 可观测性 | 毫秒级留痕 Filter 执行耗时与修改前后差异快照，防止改包盲猜。 |
 | 数据说明 | 通过 MCP 提供表清单、字段定义和跨表关联关系，帮助 Agent 正确理解数据。 |
 | 灵活查询 | 通过受限的只读 SQL 接口，让 Agent 自己筛选、统计和关联数据。 |
 | 图表呈现 | Agent 决定统计口径并查询结果，再调用绘图接口呈现结果。 |
@@ -52,6 +54,8 @@ AI Agent：理解意图 → 编写 SQL → 查询 → 检查证据 → 决定下
 | `conn` | 代理观察到的连接元数据、端点和时间信息。 | `uid`、采集批次、客户端/服务端端点、时间。 |
 | `dns` | 被茄盒观察到的 DNS 查询与响应。 | 域名、解析地址、时间；需注意 DNS 与连接的对应关系并非总能保证。 |
 | `tcp_message` / `udp_message` | mitmproxy 提供的代理层 TCP 数据块或 UDP datagram。 | `uid`、方向、时间、对应连接元数据。 |
+| `filter_registry` | 动态 Filter 规则注册表；记录 Agent 安装的代码、描述、优先级与启用状态。 | `name`。 |
+| `filter_hits` | Filter 命中日志；记录哪个 Filter 在何时拦截了哪个请求、执行动作与详细 diff 修改摘要。 | `flow_uid` ↔ `http.uid`、`filter_name` ↔ `filter_registry.name`。 |
 | `capture_session` | 一次采集批次的元数据。 | `session_id`。 |
 | `capture_control` | 当前采集状态。 | 控制采集写入行为，不是网络事件表。 |
 
@@ -75,6 +79,17 @@ AI Agent：理解意图 → 编写 SQL → 查询 → 检查证据 → 决定下
 | `get_data_relationships` | 读取跨表关联说明和注意事项。 |
 | `query_events_sql(sql, row_limit=100)` | 执行只读 `SELECT` / `WITH` 查询，返回行数和内容受限。 |
 | `render_chart(...)` | 将 Agent 查询得到的数据渲染成图表；统计口径由 Agent 的 SQL 决定。 |
+
+### Agent 动态干预与请求重放 (Filter & Replay)
+
+| 接口 | 用途 |
+|---|---|
+| `install_filter(name, code, description, priority=100)` | 安装或热更新动态 Python Filter，自动执行 AST 语法分析与安全检查，支持请求改写、Mock 与阻断。 |
+| `list_filters` | 列出所有已安装的 Filter、功能描述、累计命中数、最后命中时间及熔断状态。 |
+| `get_filter_hits(filter_name=None, action=None, limit=20)` | 快速检索最近的 Filter 拦截快照，返回解析好的修改前后 Diff 摘要与执行耗时。 |
+| `toggle_filter(name, enabled)` | 启用或停用指定的 Filter，无需删除代码。 |
+| `remove_filter(name)` | 卸载指定的 Filter 规则。 |
+| `replay_request(uid, modifications=None)` | 根据历史流量的 `uid` 原样或修改（重写 Headers/Query/Body）后重新发起请求。 |
 
 ### Agent 控制采集和目标程序
 
@@ -119,6 +134,7 @@ python mcp_server.py --init --transport streamable-http --host 127.0.0.1 --port 
 
 - [`DATABASE_SCHEMA.md`](DATABASE_SCHEMA.md)：SQLite 表结构
 - [`DATA_RELATIONSHIPS.md`](DATA_RELATIONSHIPS.md)：表之间的关联关系
+- [`docs/FILTER_CEP_DESIGN.md`](docs/FILTER_CEP_DESIGN.md)：可插拔 Filter 与 CEP 复杂事件处理机制详细设计
 - [`PLUGIN_INTEGRATION_PLAN.md`](PLUGIN_INTEGRATION_PLAN.md)：Ghost Proxifier 插件接入说明
 
 ## 许可
