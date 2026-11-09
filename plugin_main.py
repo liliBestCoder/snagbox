@@ -356,25 +356,169 @@ def _start_ui(mcp_port: int, proxy_port: int):
             if self.path != route or self.headers.get("Host", "") != expected_host:
                 self.send_error(404)
                 return
-            page = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+            page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>snagbox</title>
-<style>body{{font:14px system-ui,sans-serif;margin:24px;color:#e6e9ef;background:#151922}}h1{{font-size:20px}}code{{color:#91d5ff}}li{{margin:10px 0}}</style>
-<h1>snagbox 已启动</h1><ul><li>Ghost 上游节点：<code>snagbox</code> → <code>127.0.0.1:{proxy_port}</code></li>
-<li>代理入口：<code>HTTP CONNECT 127.0.0.1:{proxy_port}</code></li>
-<li>MCP：<code>http://127.0.0.1:{mcp_port}/mcp</code></li>
-<li>进程控制 MCP：<code>list_snagbox_processes</code>、<code>start_snagbox_program</code>、<code>stop_snagbox_program</code></li>
-<li>上游 HTTP 代理 MCP：<code>get_upstream_http_proxy</code>、<code>set_upstream_http_proxy</code></li>
-<li>HTTPS 根证书 MCP：<code>get_https_inspection_status</code>、<code>install_https_root_certificate</code>、<code>uninstall_https_root_certificate</code></li></ul>
-<p>启动会创建一个新进程；停止只作用于 Ghost 识别为 snagbox 目标的进程。</p>
-<p>新注入程序使用 DOT DNS；可通过 MCP 为 Snagbox 设置或清除链式 HTTP 代理。</p>
-<p><code>stop_listening</code> 会停止采集并清除已有事件行；Snagbox、MCP 和代理转发继续运行。</p></html>"""
+<style>
+:root {{
+  --bg: #f8fafc;
+  --card-bg: #ffffff;
+  --card-border: #e2e8f0;
+  --text-main: #0f172a;
+  --text-muted: #64748b;
+  --accent: #0284c7;
+  --code-bg: #f1f5f9;
+  --code-text: #0369a1;
+  --status-ok: #10b981;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #0f172a;
+    --card-bg: #1e293b;
+    --card-border: #334155;
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+    --accent: #38bdf8;
+    --code-bg: #0f172a;
+    --code-text: #38bdf8;
+    --status-ok: #34d399;
+  }}
+}}
+html[data-theme="dark"] {{
+  --bg: #0f172a;
+  --card-bg: #1e293b;
+  --card-border: #334155;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --accent: #38bdf8;
+  --code-bg: #0f172a;
+  --code-text: #38bdf8;
+  --status-ok: #34d399;
+}}
+html[data-theme="light"] {{
+  --bg: #f8fafc;
+  --card-bg: #ffffff;
+  --card-border: #e2e8f0;
+  --text-main: #0f172a;
+  --text-muted: #64748b;
+  --accent: #0284c7;
+  --code-bg: #f1f5f9;
+  --code-text: #0369a1;
+  --status-ok: #10b981;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font: 13px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--text-main);
+  transition: background 0.2s, color 0.2s;
+}}
+.header {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}}
+.status-dot {{
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--status-ok);
+  box-shadow: 0 0 8px var(--status-ok);
+}}
+h1 {{
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+}}
+.grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}}
+.card {{
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}}
+.card-title {{
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 8px 0;
+  color: var(--accent);
+}}
+.item {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--card-border);
+  font-size: 12px;
+}}
+.item:last-child {{ border-bottom: none; }}
+.label {{ color: var(--text-muted); }}
+code {{
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  background: var(--code-bg);
+  color: var(--code-text);
+  padding: 2px 6px;
+  border-radius: 4px;
+}}
+ul {{ margin: 4px 0; padding-left: 18px; color: var(--text-muted); font-size: 12px; }}
+li {{ margin: 3px 0; }}
+.footer-notes {{
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  border-top: 1px solid var(--card-border);
+  padding-top: 10px;
+}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="status-dot"></div>
+  <h1>snagbox 流量采集已就绪</h1>
+</div>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">网络与服务端口</div>
+    <div class="item"><span class="label">Ghost 节点</span><code>snagbox</code></div>
+    <div class="item"><span class="label">代理入口</span><code>127.0.0.1:{proxy_port}</code></div>
+    <div class="item"><span class="label">MCP 服务</span><code>http://127.0.0.1:{mcp_port}/mcp</code></div>
+  </div>
+  <div class="card">
+    <div class="card-title">AI Agent 控制与分析</div>
+    <ul>
+      <li>目标进程：<code>start_snagbox_program</code>、<code>stop_snagbox_program</code></li>
+      <li>动态改包：<code>install_filter</code>、<code>list_filters</code>、<code>get_filter_hits</code></li>
+      <li>只读探查：<code>list_event_tables</code>、<code>query_events_sql</code></li>
+      <li>安全配置：<code>get_https_inspection_status</code>、<code>install_https_root_certificate</code></li>
+    </ul>
+  </div>
+</div>
+<div class="footer-notes">
+  <p style="margin:2px 0;">• 注入程序自动使用 DOT DNS；<code>stop_listening</code> 仅清除当前批次数据，代理和 MCP 保持长效运行。</p>
+</div>
+<script>
+window.addEventListener("message", function(e) {{
+  if (e.data && e.data.theme) {{
+    document.documentElement.setAttribute("data-theme", e.data.theme);
+  }}
+}});
+</script>
+</body></html>"""
             body = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors http://127.0.0.1:23551 http://localhost:23551")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors http://127.0.0.1:23551 http://localhost:23551")
             self.end_headers()
             self.wfile.write(body)
 
