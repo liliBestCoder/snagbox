@@ -443,9 +443,23 @@ def run_hosted() -> int:
         _write_line({"v": 1, "ok": True, "uiUrl": ui_url})
         replied = True
 
+        try:
+            mcp_module.ghost_log("snagbox traffic capture and MCP bridge initialized successfully.")
+            mcp_module.ghost_toast("snagbox", "traffic capture and MCP bridge initialized successfully.")
+        except Exception:
+            pass
+
         _wait_for_stop(stop_event)
+        mcp_module.ghost_log("snagbox received stop signal, shutting down gracefully.")
         return 0
     except Exception as exc:
+        try:
+            import traceback
+            err_text = traceback.format_exc()
+            if "data_dir" in locals() and data_dir:
+                (data_dir / "startup_error.log").write_text(err_text, encoding="utf-8")
+        except Exception:
+            pass
         if not replied:
             try:
                 _write_line({"v": 1, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:512]})

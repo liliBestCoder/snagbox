@@ -6,4 +6,6 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 plugin-package/.stage/
+plugin-package/.build/
 plugin-package/dist/
+.build/
