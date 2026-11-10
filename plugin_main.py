@@ -160,10 +160,10 @@ def _configure_https_inspection(data_dir: Path, master, loop: asyncio.AbstractEv
                     "certificate_thumbprint": thumbprint,
                     "certificate_path": str(certificate_path),
                     "command": f'certutil.exe -user -addstore Root "{certificate_path}"',
-                    "next_step": "get_https_inspection_status",
+                    "next_step": "get_status",
                     "instruction": (
                         "To trust this root certificate, execute the command in your host terminal, "
-                        "then call get_https_inspection_status to synchronize and activate HTTPS inspection."
+                        "then call get_status to synchronize and activate HTTPS inspection."
                     ),
                 }
             try:
@@ -182,10 +182,10 @@ def _configure_https_inspection(data_dir: Path, master, loop: asyncio.AbstractEv
                     "https_mode": "intercept",
                     "certificate_thumbprint": thumbprint,
                     "command": f'reg.exe delete "{key_path}" /f',
-                    "next_step": "get_https_inspection_status",
+                    "next_step": "get_status",
                     "instruction": (
                         "To remove this root certificate from trust, execute the command in your host terminal, "
-                        "then call get_https_inspection_status to synchronize and deactivate HTTPS interception."
+                        "then call get_status to synchronize and deactivate HTTPS interception."
                     ),
                 }
             try:

@@ -115,9 +115,43 @@ def _control_https_inspection(action: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_status() -> dict[str, Any]:
+    """Show comprehensive Snagbox status: HTTPS inspection & CA trust, upstream proxy chaining, and active proxified processes."""
+    base_status = _control_https_inspection("status")
+    if not isinstance(base_status, dict):
+        base_status = {"status": "ok", "raw": base_status}
+
+    # 1. Upstream proxy chaining status
+    base_status["upstream_proxy"] = {
+        "enabled": bool(_upstream_http_proxy["proxy_url"]),
+        "proxy_url": _upstream_http_proxy["proxy_url"] or None,
+        "authenticated": bool(_upstream_http_proxy["username"]),
+    }
+
+    # 2. Active monitored/proxified processes
+    try:
+        targets_res = _list_snagbox_targets()
+        if isinstance(targets_res, dict) and targets_res.get("status") == "ok":
+            targets = targets_res.get("targets", [])
+            base_status["targets_count"] = len(targets)
+            base_status["targets"] = targets
+        else:
+            base_status["targets_count"] = 0
+            base_status["targets"] = []
+            if isinstance(targets_res, dict) and targets_res.get("error"):
+                base_status["targets_error"] = targets_res["error"]
+    except Exception as exc:
+        base_status["targets_count"] = 0
+        base_status["targets"] = []
+        base_status["targets_error"] = str(exc)[:200]
+
+    return base_status
+
+
+@mcp.tool()
 def get_https_inspection_status() -> dict[str, Any]:
-    """Show whether Snagbox's root CA is trusted and synchronize HTTPS interception accordingly."""
-    return _control_https_inspection("status")
+    """Alias for get_status (showing HTTPS inspection, upstream proxy, and active processes)."""
+    return get_status()
 
 
 @mcp.tool()
@@ -125,7 +159,7 @@ def install_https_root_certificate() -> dict[str, Any]:
     """Request installation of Snagbox's mitmproxy CA in the current user's Windows Root store.
     
     If not already installed, returns status 'action_required' with a 'command' field.
-    The caller/agent MUST execute this command in a host terminal, then call get_https_inspection_status to synchronize and activate HTTPS interception.
+    The caller/agent MUST execute this command in a host terminal, then call get_status to synchronize and activate HTTPS inspection.
     """
     return _control_https_inspection("install")
 
@@ -135,20 +169,9 @@ def uninstall_https_root_certificate() -> dict[str, Any]:
     """Request removal of Snagbox's mitmproxy CA from the current user's Windows Root store.
     
     If currently installed, returns status 'action_required' with a 'command' field.
-    The caller/agent MUST execute this command in a host terminal, then call get_https_inspection_status to synchronize and deactivate HTTPS interception.
+    The caller/agent MUST execute this command in a host terminal, then call get_status to synchronize and deactivate HTTPS interception.
     """
     return _control_https_inspection("uninstall")
-
-
-@mcp.tool()
-def get_upstream_http_proxy() -> dict[str, Any]:
-    """Show the HTTP proxy chained after Snagbox. Credentials are never returned."""
-    return {
-        "status": "ok",
-        "enabled": bool(_upstream_http_proxy["proxy_url"]),
-        "proxy_url": _upstream_http_proxy["proxy_url"] or None,
-        "authenticated": bool(_upstream_http_proxy["username"]),
-    }
 
 
 @mcp.tool()
@@ -304,10 +327,6 @@ def _list_snagbox_targets() -> dict[str, Any]:
     return {"status": "ok", "nodeId": _snagbox_node_id, "targets": targets}
 
 
-@mcp.tool()
-def list_snagbox_processes() -> dict[str, Any]:
-    """List Ghost targets currently configured or running under snagbox upstream."""
-    return _list_snagbox_targets()
 
 
 @mcp.tool()
