@@ -17,6 +17,7 @@ from typing import Any
 
 
 PROXY_PORT = 8080
+MCP_PORT = 23553
 
 
 def _write_line(value: dict[str, Any]) -> None:
@@ -28,6 +29,15 @@ def _free_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _preferred_mcp_port(preferred: int = MCP_PORT) -> int:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", preferred))
+            return preferred
+    except OSError:
+        return _free_loopback_port()
 
 
 def _wait_port(port: int, server_thread: threading.Thread | None = None, timeout: float = 8.0) -> bool:
@@ -141,52 +151,47 @@ def _configure_https_inspection(data_dir: Path, master, loop: asyncio.AbstractEv
             return result(thumbprint, installed, existing_connections_may_need_reconnect=True)
 
         if action == "install":
-            added = False
             if not installed:
-                try:
-                    _code, output = _run_certutil("-f", "-user", "-addstore", "Root", str(certificate_path))
-                    _, installed = certificate_info()
-                except Exception as exc:
-                    return {"status": "error", "error": "certificate_install_failed", "detail": str(exc)[:500]}
-                if not installed:
-                    return {
-                        "status": "error", "error": "certificate_install_failed",
-                        "detail": output[-500:] or "Certificate was not found in the current user's Root store",
-                    }
-                added = True
+                return {
+                    "status": "action_required",
+                    "action": "install",
+                    "certificate_installed": False,
+                    "https_mode": "passthrough",
+                    "certificate_thumbprint": thumbprint,
+                    "certificate_path": str(certificate_path),
+                    "command": f'certutil.exe -user -addstore Root "{certificate_path}"',
+                    "next_step": "get_https_inspection_status",
+                    "instruction": (
+                        "To trust this root certificate, execute the command in your host terminal, "
+                        "then call get_https_inspection_status to synchronize and activate HTTPS inspection."
+                    ),
+                }
             try:
                 _apply_https_interception(master, loop, True)
             except Exception as exc:
-                if added:
-                    try:
-                        _run_certutil("-user", "-delstore", "Root", thumbprint)
-                    except Exception:
-                        pass
                 return {"status": "error", "error": "https_policy_update_failed", "detail": str(exc)[:300]}
             return result(thumbprint, True, existing_connections_may_need_reconnect=True)
 
         if action == "uninstall":
+            if installed:
+                key_path = f"HKCU\\Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}"
+                return {
+                    "status": "action_required",
+                    "action": "uninstall",
+                    "certificate_installed": True,
+                    "https_mode": "intercept",
+                    "certificate_thumbprint": thumbprint,
+                    "command": f'reg.exe delete "{key_path}" /f',
+                    "next_step": "get_https_inspection_status",
+                    "instruction": (
+                        "To remove this root certificate from trust, execute the command in your host terminal, "
+                        "then call get_https_inspection_status to synchronize and deactivate HTTPS interception."
+                    ),
+                }
             try:
-                # Stop presenting a locally generated certificate before removing its trust.
                 _apply_https_interception(master, loop, False)
             except Exception as exc:
                 return {"status": "error", "error": "https_policy_update_failed", "detail": str(exc)[:300]}
-            if installed:
-                try:
-                    _code, output = _run_certutil("-user", "-delstore", "Root", thumbprint)
-                    _, installed = certificate_info()
-                except Exception as exc:
-                    return {
-                        "status": "error", "error": "certificate_uninstall_failed",
-                        "https_mode": "passthrough", "detail": str(exc)[:500],
-                    }
-                if installed:
-                    return {
-                        "status": "error", "error": "certificate_uninstall_failed",
-                        "https_mode": "passthrough", "certificate_installed": True,
-                        "certificate_thumbprint": thumbprint,
-                        "detail": output[-500:] or "Certificate remains in the current user's Root store",
-                    }
             return result(thumbprint, False, existing_connections_may_need_reconnect=True)
 
         return {"status": "error", "error": "invalid_certificate_action"}
@@ -581,7 +586,11 @@ def run_hosted() -> int:
         )
         node = mcp_module.configure_ghost_bridge(api_base, token, PROXY_PORT)
 
-        mcp_port = _free_loopback_port()
+        mcp_port = _preferred_mcp_port(MCP_PORT)
+        try:
+            (data_dir / "mcp_port.txt").write_text(str(mcp_port), encoding="utf-8")
+        except Exception:
+            pass
         mcp_server, mcp_thread = _start_mcp(data_dir, mcp_port)
         ui_server, _ui_thread, ui_url = _start_ui(mcp_port, PROXY_PORT)
         _write_line({"v": 1, "ok": True, "uiUrl": ui_url})

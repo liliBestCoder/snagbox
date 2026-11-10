@@ -122,13 +122,21 @@ def get_https_inspection_status() -> dict[str, Any]:
 
 @mcp.tool()
 def install_https_root_certificate() -> dict[str, Any]:
-    """Install Snagbox's mitmproxy CA in the current user's Windows Root store and enable HTTPS inspection."""
+    """Request installation of Snagbox's mitmproxy CA in the current user's Windows Root store.
+    
+    If not already installed, returns status 'action_required' with a 'command' field.
+    The caller/agent MUST execute this command in a host terminal, then call get_https_inspection_status to synchronize and activate HTTPS interception.
+    """
     return _control_https_inspection("install")
 
 
 @mcp.tool()
 def uninstall_https_root_certificate() -> dict[str, Any]:
-    """Remove only Snagbox's mitmproxy CA from the current user's Windows Root store and disable HTTPS inspection."""
+    """Request removal of Snagbox's mitmproxy CA from the current user's Windows Root store.
+    
+    If currently installed, returns status 'action_required' with a 'command' field.
+    The caller/agent MUST execute this command in a host terminal, then call get_https_inspection_status to synchronize and deactivate HTTPS interception.
+    """
     return _control_https_inspection("uninstall")
 
 
@@ -1191,7 +1199,7 @@ def main() -> None:
     parser.add_argument("--init", action="store_true", help="Create an empty database before starting MCP")
     parser.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio", help="MCP transport")
     parser.add_argument("--host", default="127.0.0.1", help="HTTP MCP bind address")
-    parser.add_argument("--port", type=int, default=8000, help="HTTP MCP port")
+    parser.add_argument("--port", type=int, default=23553, help="HTTP MCP port")
     args = parser.parse_args()
     _db_path = Path(args.db).expanduser().resolve()
     mcp.settings.host = args.host
