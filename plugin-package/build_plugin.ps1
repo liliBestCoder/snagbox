@@ -61,7 +61,7 @@ if (-not $SkipCompile -or -not (Test-Path -LiteralPath $exePath -PathType Leaf))
         "--specpath", $buildRoot, "--paths", $projectRoot,
         "--additional-hooks-dir", $hookPath,
         "--add-data", "$relationshipFile;.",
-        "--hidden-import=addon", "--hidden-import=database", "--hidden-import=mcp_server",
+        "--hidden-import=addon", "--hidden-import=database", "--hidden-import=mcp_server", "--hidden-import=proc_resolver",
         "--collect-all=mitmproxy", "--collect-all=mitmproxy_rs", "--collect-submodules=mcp.server",
         "--collect-all=uvicorn",
         "--hidden-import=pydivert",
