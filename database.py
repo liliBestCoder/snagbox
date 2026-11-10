@@ -54,11 +54,19 @@ CREATE TABLE IF NOT EXISTS conn (
     session_id TEXT NOT NULL,
     capture_label TEXT NOT NULL,
     error TEXT,
+    pid INTEGER,
+    process_name TEXT,
+    process_path TEXT,
+    root_pid INTEGER,
+    root_process_name TEXT,
+    target_id TEXT,
     FOREIGN KEY(session_id) REFERENCES capture_session(session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_conn_ts ON conn(ts);
 CREATE INDEX IF NOT EXISTS idx_conn_orig ON conn("id.orig_h", "id.orig_p");
 CREATE INDEX IF NOT EXISTS idx_conn_resp ON conn("id.resp_h", "id.resp_p");
+CREATE INDEX IF NOT EXISTS idx_conn_pid ON conn(pid);
+CREATE INDEX IF NOT EXISTS idx_conn_target ON conn(target_id);
 
 CREATE TABLE IF NOT EXISTS http (
     uid TEXT PRIMARY KEY,
@@ -202,7 +210,7 @@ BEGIN SELECT RAISE(IGNORE); END;
 
 TABLE_DESCRIPTIONS = {
     "capture_session": "本机采集批次与人工标签。",
-    "conn": "Zeek conn.log 风格的传输连接记录；包数及 IP 层字节数不可得时为 NULL。",
+    "conn": "Zeek conn.log 风格的传输连接记录；包含底层真实连接 PID、进程路径及向上追溯 5 层匹配到的受管 Target 属性（root_pid, root_process_name, target_id）；包数及 IP 层字节数不可得时为 NULL。",
     "http": "HTTP 请求/响应元数据、完整头字段（JSON 键值对数组）及请求体/响应体原始实体字节（BLOB）。",
     "dns": "Zeek dns.log 风格的 DNS 查询与响应。",
     "tcp_message": "扩展表：mitmproxy 收到的 TCP 字节块；未信任根证书时可包含加密 TLS 隧道字节；块边界不等于协议消息边界。",
@@ -234,6 +242,18 @@ class NetTraceDB:
         registry_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(filter_registry)")}
         if "description" not in registry_columns:
             self.conn.execute("ALTER TABLE filter_registry ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+
+        conn_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(conn)")}
+        for column, column_type in (
+            ("pid", "INTEGER"),
+            ("process_name", "TEXT"),
+            ("process_path", "TEXT"),
+            ("root_pid", "INTEGER"),
+            ("root_process_name", "TEXT"),
+            ("target_id", "TEXT"),
+        ):
+            if column not in conn_columns:
+                self.conn.execute(f"ALTER TABLE conn ADD COLUMN {column} {column_type}")
 
         self.conn.commit()
 
@@ -276,16 +296,23 @@ class NetTraceDB:
         capture_label: str,
         local_orig: int | None = None,
         local_resp: int | None = None,
+        pid: int | None = None,
+        process_name: str | None = None,
+        process_path: str | None = None,
+        root_pid: int | None = None,
+        root_process_name: str | None = None,
+        target_id: str | None = None,
     ) -> None:
         self.conn.execute(
             '''INSERT OR IGNORE INTO conn
                (uid, ts, "id.orig_h", "id.orig_p", "id.resp_h", "id.resp_p", proto,
                 service, duration, orig_bytes, resp_bytes, conn_state, local_orig, local_resp,
                 missed_bytes, history, orig_pkts, orig_ip_bytes, resp_pkts, resp_ip_bytes,
-                session_id, capture_label)
+                session_id, capture_label, pid, process_name, process_path, root_pid, root_process_name, target_id)
                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?,
-                       NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)''',
-            (uid, ts, orig_h, orig_p, resp_h, resp_p, proto, local_orig, local_resp, session_id, capture_label),
+                       NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (uid, ts, orig_h, orig_p, resp_h, resp_p, proto, local_orig, local_resp, session_id, capture_label,
+             pid, process_name, process_path, root_pid, root_process_name, target_id),
         )
         self.conn.commit()
 

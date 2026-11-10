@@ -18,6 +18,7 @@ from typing import Any, Callable
 from mitmproxy import ctx, http
 
 from database import AsyncNetTraceDB, read_capture_state, readonly_connection
+from proc_resolver import resolve_process_and_target
 
 
 def flow_uid(flow: Any) -> str:
@@ -437,9 +438,16 @@ class NetTraceAddon:
         if uid in self.ensured:
             return uid
         orig_h, orig_p, resp_h, resp_p = addresses(flow)
+        proc_info = resolve_process_and_target(orig_p, max_ancestor_depth=5)
         queued = self._require_db().ensure_conn(
             uid, stamp(ts), proto, orig_h, orig_p, resp_h, resp_p,
             self.session_id, self.label, local_flag(orig_h), local_flag(resp_h),
+            pid=proc_info.get("pid"),
+            process_name=proc_info.get("process_name"),
+            process_path=proc_info.get("process_path"),
+            root_pid=proc_info.get("root_pid"),
+            root_process_name=proc_info.get("root_process_name"),
+            target_id=proc_info.get("target_id"),
         )
         if queued:
             self.ensured.add(uid)
