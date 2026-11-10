@@ -65,8 +65,6 @@ CREATE TABLE IF NOT EXISTS conn (
 CREATE INDEX IF NOT EXISTS idx_conn_ts ON conn(ts);
 CREATE INDEX IF NOT EXISTS idx_conn_orig ON conn("id.orig_h", "id.orig_p");
 CREATE INDEX IF NOT EXISTS idx_conn_resp ON conn("id.resp_h", "id.resp_p");
-CREATE INDEX IF NOT EXISTS idx_conn_pid ON conn(pid);
-CREATE INDEX IF NOT EXISTS idx_conn_target ON conn(target_id);
 
 CREATE TABLE IF NOT EXISTS http (
     uid TEXT PRIMARY KEY,
@@ -254,6 +252,9 @@ class NetTraceDB:
         ):
             if column not in conn_columns:
                 self.conn.execute(f"ALTER TABLE conn ADD COLUMN {column} {column_type}")
+
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_conn_pid ON conn(pid)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_conn_target ON conn(target_id)")
 
         self.conn.commit()
 
